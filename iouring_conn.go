@@ -52,80 +52,22 @@ type Result struct {
 	Err error
 }
 
-// UringManager 管理 io_uring 实例的生命周期、资源池及结果分发。
-type UringManager struct {
-	ring      *Ring
-	bufPool   *MultiPool
-	pending   sync.Map
-	requestID uint64
-	sqeWaiter chan struct{}
-	mu        sync.Mutex
-}
-
 type requestCtx struct {
-	resCh    chan Result
-	bufPtr   *[]byte
-	msg      *unix.Msghdr
-	sockaddr *unix.RawSockaddrAny
-}
+	resCh  chan Result
+	bufPtr *[]byte
 
-func NewUringManager(r *Ring, p *MultiPool) *UringManager {
-	m := &UringManager{
-		ring:      r,
-		bufPool:   p,
-		sqeWaiter: make(chan struct{}, 1),
-	}
-	go m.reaper()
-	return m
-}
-
-func (m *UringManager) reaper() {
-	for {
-		userData, res, err := m.ring.WaitCQE()
-		if err != nil {
-			return
-		}
-
-		select {
-		case m.sqeWaiter <- struct{}{}:
-		default:
-		}
-
-		if userData == 0 {
-			continue
-		}
-
-		if ctxInterface, ok := m.pending.LoadAndDelete(userData); ok {
-			ctx := ctxInterface.(*requestCtx)
-			if ctx.bufPtr != nil {
-				m.bufPool.Put(ctx.bufPtr)
-			}
-
-			if ctx.resCh != nil {
-				var resErr error
-				if res < 0 {
-					errno := unix.Errno(-res)
-					if errno == unix.ETIME || errno == unix.ECANCELED {
-						resErr = os.ErrDeadlineExceeded
-					} else {
-						resErr = errno
-					}
-					res = 0
-				}
-				select {
-				case ctx.resCh <- Result{N: int(res), Err: resErr}:
-				default:
-				}
-			}
-		}
-	}
+	// 关键：直接存储结构体，而不是指针
+	// 这样这些内存会随着 requestCtx 一起分配在堆上
+	msg unix.Msghdr
+	iov unix.Iovec
+	sa  unix.RawSockaddrAny
 }
 
 type UringConn struct {
 	// 【核心修复点】预分配固定内存，防止异步期间 timespec 被移动
 	readTs        *kernelTimespec
 	writeTs       *kernelTimespec
-	fd            int
+	fd            int32
 	manager       *UringManager
 	laddr         net.Addr
 	raddr         net.Addr
@@ -142,7 +84,7 @@ func InitRing() {
 		panic(err)
 	}
 	fmt.Println("will calling NewUringManager")
-	defaultManager = NewUringManager(r, NewMultiPool())
+	defaultManager = NewUringManager(r, NewMultiPool(), time.Millisecond, 100)
 	fmt.Println("done: calling NewUringManager")
 }
 
@@ -211,7 +153,7 @@ func NewUringConn(rawConn net.Conn, manager *UringManager) (net.Conn, error) {
 	// 原 rawConn 将随对象生命周期结束被 GC。
 
 	c := &UringConn{
-		fd:      fd,
+		fd:      int32(fd),
 		manager: manager,
 		file:    f,
 		laddr:   laddr,
@@ -243,20 +185,8 @@ func (u *UringConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// 【修复点】修改为填充固定成员地址
-func (u *UringConn) fillTs(ts *kernelTimespec, t *time.Time) bool {
-	if t == nil || t.IsZero() {
-		return false
-	}
-	d := time.Until(*t)
-	if d <= 0 {
-		ts.tv_sec = 0
-		ts.tv_nsec = 1
-		return true
-	}
-	ts.tv_sec = int64(d.Seconds())
-	ts.tv_nsec = int64(d.Nanoseconds() % 1e9)
-	return true
+func (u *UringConn) File() (*os.File, error) {
+	return u.file, nil
 }
 
 func (u *UringConn) Write(b []byte) (n int, err error) {
@@ -332,17 +262,17 @@ func (u *UringConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 	id := atomic.AddUint64(&u.manager.requestID, 1)
 	iov := unix.Iovec{Base: &(*bufPtr)[0], Len: uint64(len(b))}
-	msghdr := &unix.Msghdr{
-		Name:    (*byte)(unsafe.Pointer(sa)),
-		Namelen: uint32(saLen),
-		Iov:     &iov,
-		Iovlen:  1,
+	reqCtx := &requestCtx{
+		bufPtr: bufPtr,
+		msg: unix.Msghdr{
+			Name:    (*byte)(unsafe.Pointer(sa)),
+			Namelen: uint32(saLen),
+			Iov:     &iov,
+			Iovlen:  1,
+		},
 	}
 
-	u.manager.pending.Store(id, &requestCtx{
-		bufPtr: bufPtr,
-		msg:    msghdr,
-	})
+	u.manager.pending.Store(id, reqCtx)
 
 	numSQEs := uint32(1)
 	if hasTimeout {
@@ -355,7 +285,7 @@ func (u *UringConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	sqe := sqes[0]
 	sqe.Opcode = IORING_OP_SENDMSG
 	sqe.Fd = int32(u.fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(msghdr)))
+	sqe.Addr = uint64(uintptr(unsafe.Pointer(&reqCtx.msg)))
 	sqe.Len = 1
 	sqe.UserData = id
 
@@ -486,96 +416,22 @@ func (u *UringConn) Read(b []byte) (n int, err error) {
 	return res.N, res.Err
 }
 
-func (u *UringConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	if len(b) == 0 {
-		return 0, nil, nil
-	}
-	// 强制让 b 逃逸到堆
-	runtime.KeepAlive(&b[0])
-
-	//bb := make([]byte, 4096)
-	//nn := runtime.Stack(bb, false)
-	//fmt.Printf("ReadFrom: will calling Read for conn %v: from:\n%s", u.RemoteAddr(), bb[:nn])
-
-	hasTimeout := u.fillTs(u.readTs, u.readDeadline.Load())
-	id := atomic.AddUint64(&u.manager.requestID, 1)
-	ch := readResultChanPool.Get().(chan Result)
-
-	sa := new(unix.RawSockaddrAny)
-	iov := unix.Iovec{Base: &b[0], Len: uint64(len(b))}
-	msghdr := &unix.Msghdr{
-		Name:    (*byte)(unsafe.Pointer(sa)),
-		Namelen: uint32(unix.SizeofSockaddrAny),
-		Iov:     &iov,
-		Iovlen:  1,
-	}
-
-	u.manager.pending.Store(id, &requestCtx{
-		resCh:    ch,
-		msg:      msghdr,
-		sockaddr: sa,
-	})
-
-	numSQEs := uint32(1)
-	if hasTimeout {
-		numSQEs = 2
-	}
-
-	u.manager.mu.Lock()
-	sqes := u.getSQEsBlocking(numSQEs)
-
-	sqe := sqes[0]
-	sqe.Opcode = IORING_OP_RECVMSG
-	sqe.Fd = int32(u.fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(msghdr)))
-	sqe.Len = 1
-	sqe.UserData = id
-
-	if hasTimeout {
-		sqe.Flags |= IOSQE_IO_LINK
-		tsqe := sqes[1]
-		tsqe.Opcode = IORING_OP_LINK_TIMEOUT
-		tsqe.Fd = -1
-		tsqe.Addr = uint64(uintptr(unsafe.Pointer(u.readTs)))
-		tsqe.Len = 1
-		tsqe.UserData = 0
-	}
-
-	u.manager.ring.FlushSQEs(numSQEs)
-	if err := u.manager.ring.Submit(numSQEs); err != nil {
-		u.manager.mu.Unlock()
-		u.manager.pending.Delete(id)
-		readResultChanPool.Put(ch)
-		return 0, nil, err
-	}
-	u.manager.mu.Unlock()
-
-	res := <-ch
-	readResultChanPool.Put(ch)
-	//fmt.Printf("ReadFrom: got %d bytes for conn %v, err=%v\n", res.N, u.RemoteAddr(), res.Err)
-
-	if res.Err != nil {
-		return 0, nil, res.Err
-	}
-	if res.N == 0 {
-		return 0, nil, io.EOF
-	}
-
-	netAddr, _ := parseSockaddr(sa)
-	runtime.KeepAlive(u)
-	return res.N, netAddr, nil
+func (u *UringConn) SetReadBuffer(bytes int) error {
+	return unix.SetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_RCVBUF, bytes)
 }
 
-func (u *UringConn) ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error) {
-	n, a, err := u.ReadFrom(b)
-	if a != nil {
-		return n, a.(*net.UDPAddr), err
-	}
-	return n, nil, err
+// SetWriteBuffer 设置内核套接字发送缓冲区大小
+func (u *UringConn) SetWriteBuffer(bytes int) error {
+	// 强制限制：Linux 内核会对这个值进行翻倍，以预留出 sk_buff 结构开销
+	return unix.SetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, bytes)
 }
 
-func (u *UringConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
-	return u.WriteTo(b, addr)
+func (u *UringConn) GetWriteBuffer() (int, error) {
+	return unix.GetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
+}
+
+func (u *UringConn) GetReadBuffer() (int, error) {
+	return unix.GetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
 }
 
 func (u *UringConn) Close() error {
@@ -638,4 +494,46 @@ func addrToSockaddr(addr net.Addr) (*unix.RawSockaddrAny, uint32, error) {
 	binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&sa.Port))[:], uint16(udp.Port))
 	copy(sa.Addr[:], udp.IP.To16())
 	return (*unix.RawSockaddrAny)(unsafe.Pointer(sa)), unix.SizeofSockaddrInet6, nil
+}
+
+// wrapProtocolError 统一封装协议不支持的错误
+func (u *UringConn) wrapProtocolError(op string) error {
+	network := "unknown"
+	if u.laddr != nil {
+		network = u.laddr.Network()
+	}
+
+	return u.wrapError(op, network, unix.ENOPROTOOPT)
+}
+
+// isUDP 辅助判断，让逻辑更清晰
+func (u *UringConn) isUDP() bool {
+	_, ok := u.laddr.(*net.UDPAddr)
+	return ok
+}
+
+func (u *UringConn) wrapError(op, netType string, err error) error {
+	return &net.OpError{
+		Op:     op,
+		Net:    netType,
+		Source: u.laddr,
+		Addr:   u.raddr,
+		Err:    err,
+	}
+}
+
+// 【修复点】修改为填充固定成员地址
+func (u *UringConn) fillTs(ts *kernelTimespec, t *time.Time) bool {
+	if t == nil || t.IsZero() {
+		return false
+	}
+	d := time.Until(*t)
+	if d <= 0 {
+		ts.tv_sec = 0
+		ts.tv_nsec = 1
+		return true
+	}
+	ts.tv_sec = int64(d.Seconds())
+	ts.tv_nsec = int64(d.Nanoseconds() % 1e9)
+	return true
 }

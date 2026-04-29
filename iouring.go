@@ -4,6 +4,7 @@ package common
 
 import (
 	"fmt"
+	"math/bits"
 	"runtime"
 	"sync/atomic"
 	"unsafe"
@@ -32,6 +33,7 @@ const (
 	IORING_OP_READ         = 22
 	IORING_OP_WRITE        = 23
 	IORING_OP_LINK_TIMEOUT = 15 // 新增：超时操作码
+	IORING_OP_SPLICE       = 31 // 新增：Splice 操作码
 
 	IORING_OP_RECVMSG = 17
 	IORING_OP_SENDMSG = 16
@@ -57,10 +59,11 @@ type ioCqringOffsets struct {
 }
 
 type SQE struct {
-	Opcode   uint8
-	Flags    uint8
-	Ioprio   uint16
-	Fd       int32
+	Opcode uint8
+	Flags  uint8
+	Ioprio uint16
+	Fd     int32
+
 	Off      uint64
 	Addr     uint64
 	Len      uint32
@@ -98,6 +101,8 @@ type Ring struct {
 	cqTail *uint32
 	cqMask *uint32
 	cqes   []CQE
+
+	maxEntries uint32
 }
 
 func init() {
@@ -133,6 +138,8 @@ func init() {
 
 // New 初始化 Ring
 func NewRing(entries uint32) (*Ring, error) {
+	entries = nextPowerOfTwo(entries)
+
 	var p IOUringParams
 	//p.Flags = IORING_SETUP_SQPOLL
 	//p.SqThreadIdle = 2000
@@ -144,8 +151,9 @@ func NewRing(entries uint32) (*Ring, error) {
 	}
 
 	r := &Ring{
-		fd:     int(fd),
-		params: p,
+		fd:         int(fd),
+		params:     p,
+		maxEntries: entries,
 	}
 
 	// SQ 映射
@@ -201,6 +209,10 @@ func (r *Ring) GetSQE() *SQE {
 		return nil
 	}
 	return sqes[0]
+}
+
+func (r *Ring) GetMaxEntries() uint32 {
+	return r.maxEntries
 }
 
 // GetSQEs 原子性地一次性预留 n 个连续槽位。
@@ -292,45 +304,89 @@ func (r *Ring) Submit(n uint32) error {
 	return nil
 }
 
+func (r *Ring) Close() {
+	_ = unix.Close(r.fd)
+}
+
 // WaitCQE 阻塞等待完成事件
 func (r *Ring) WaitCQE() (userData uint64, res int32, err error) {
-	for {
+	// 策略 1：极短时间的原子自旋 (Spinning)
+	// 适合处理已经在内核中完成或即将完成的任务
+	for i := 0; i < 100; i++ {
 		head := atomic.LoadUint32(r.cqHead)
-		tail := atomic.LoadUint32(r.cqTail) // 必须 Load tail
+		tail := atomic.LoadUint32(r.cqTail)
 
-		if head == tail {
-			// 使用阻塞式 Syscall，允许 Go 调度器切换 G
-			_, _, errno := unix.Syscall6(
-				unix.SYS_IO_URING_ENTER,
-				uintptr(r.fd),
-				0, // to_submit
-				1, // min_complete
-				uintptr(IORING_ENTER_GETEVENTS),
-				0, 0,
-			)
-			if errno != 0 && errno != unix.EAGAIN && errno != unix.EINTR {
-				return 0, 0, errno
+		if head != tail {
+			return r.extractCQE(head)
+		}
+		// 这里不需要 PAUSE 汇编，紧凑的原子 Load 在 x86 下已经足够高效
+	}
+
+	// 策略 2：协作式让出 (Yielding)
+	// 如果自旋没拿到，说明 IO 还没好。
+	// 我们调用 Gosched 让出当前 P 给其他 Goroutine 运行。
+	// 这比直接进内核 Syscall 要轻量，如果此时 P 队列有活，CPU 不会闲着。
+	runtime.Gosched()
+
+	// 再次检查一遍，万一在 Gosched 期间 IO 好了
+	head := atomic.LoadUint32(r.cqHead)
+	tail := atomic.LoadUint32(r.cqTail)
+	if head != tail {
+		return r.extractCQE(head)
+	}
+
+	// 策略 3：阻塞式休眠 (Blocking)
+	// 走到这一步说明 IO 确实是“慢速”的（比如网络等待）。
+	// 调用 Syscall 进入内核等待队列，彻底挂起当前线程，不消耗任何 CPU。
+	for {
+		_, _, errno := unix.Syscall6(
+			unix.SYS_IO_URING_ENTER,
+			uintptr(r.fd),
+			0, // to_submit
+			1, // min_complete: 至少等 1 个事件
+			uintptr(IORING_ENTER_GETEVENTS),
+			0, 0,
+		)
+
+		if errno != 0 {
+			if errno == unix.EINTR || errno == unix.EAGAIN {
+				continue
 			}
-			continue
+			return 0, 0, errno
 		}
 
-		// 确保读取 cqe 之前，内核对内存的写入对我们可见
-		// 在 Go 中，atomic.Load 对 tail 的读取在 x86 下保证了这一点
-
-		index := head & *r.cqMask
-		cqe := r.cqes[index]
-
-		// 拷贝数据，防止更新 head 后内存被内核覆盖
-		userData = cqe.UserData
-		res = cqe.Res
-
-		// 必须使用 Atomic Write 更新 head，告知内核槽位已空
-		atomic.StoreUint32(r.cqHead, head+1)
-
-		return userData, res, nil
+		// 被内核唤醒后，重新读取
+		h := atomic.LoadUint32(r.cqHead)
+		t := atomic.LoadUint32(r.cqTail)
+		if h != t {
+			return r.extractCQE(h)
+		}
 	}
 }
 
-func (r *Ring) Close() {
-	_ = unix.Close(r.fd)
+// 辅助函数：提取数据并更新 Head
+func (r *Ring) extractCQE(head uint32) (uint64, int32, error) {
+	index := head & *r.cqMask
+	cqe := r.cqes[index]
+
+	userData := cqe.UserData
+	res := cqe.Res
+
+	// 必须最后更新 head，告知内核该槽位已消费
+	atomic.StoreUint32(r.cqHead, head+1)
+
+	return userData, res, nil
+}
+
+func nextPowerOfTwo(n uint32) uint32 {
+	if n <= 1 {
+		return 1
+	}
+	// 如果 n 已经是 2 的幂，直接返回 n
+	if n&(n-1) == 0 {
+		return n
+	}
+	// bits.Len32(n) 返回表示 n 所需的最小位数
+	// 例如 n=5 (101)，Len32 返回 3。1 << 3 = 8
+	return 1 << bits.Len32(n)
 }

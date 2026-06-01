@@ -1,6 +1,6 @@
 //go:build linux
 
-package common
+package goiouring
 
 import (
 	"encoding/binary"
@@ -140,6 +140,7 @@ func NewUringConn(rawConn net.Conn, manager *UringManager) (net.Conn, error) {
 	}
 
 	f, err := tc.File() // 执行了 dup()
+	log.Info("tc.File() called")
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +148,7 @@ func NewUringConn(rawConn net.Conn, manager *UringManager) (net.Conn, error) {
 		return nil, err
 	}
 	fd := int(f.Fd())
+	log.Info("rawconn.close called")
 
 	// 【修复点】不再调用 rawConn.Close()。
 	// tc.File() 已经分离了 FD 状态，此时 Close 原连接会导致底层 socket 状态异常触发 EBADF。
@@ -161,6 +163,7 @@ func NewUringConn(rawConn net.Conn, manager *UringManager) (net.Conn, error) {
 		readTs:  new(kernelTimespec),
 		writeTs: new(kernelTimespec),
 	}
+	c.Write(nil)
 	runtime.KeepAlive(c.readTs)
 	runtime.KeepAlive(c.writeTs)
 	return c, nil

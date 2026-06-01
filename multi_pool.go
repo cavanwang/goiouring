@@ -1,6 +1,6 @@
 //go:build linux
 
-package common
+package goiouring
 
 import (
 	"sync"

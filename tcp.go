@@ -50,7 +50,7 @@ func (u *UringConn) SetKeepAlive(keepalive bool) error {
 	if keepalive {
 		v = 1
 	}
-	if err := unix.SetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE, v); err != nil {
+	if err := unix.SetsockoptInt(int(u.fd), unix.SOL_SOCKET, unix.SO_KEEPALIVE, v); err != nil {
 		return u.wrapError("SetKeepAlive", "tcp", os.NewSyscallError("setsockopt", err))
 	}
 	return nil
@@ -71,7 +71,7 @@ func (u *TCPURingConn) SetLinger(sec int) error {
 		l.Onoff = 0
 		l.Linger = 0
 	}
-	if err := unix.SetsockoptLinger(u.fd, unix.SOL_SOCKET, unix.SO_LINGER, &l); err != nil {
+	if err := unix.SetsockoptLinger(int(u.fd), unix.SOL_SOCKET, unix.SO_LINGER, &l); err != nil {
 		return u.wrapError("SetLinger", "tcp", os.NewSyscallError("SetsockoptLinger", err))
 	}
 
@@ -87,7 +87,7 @@ func (u *TCPURingConn) SetNoDelay(noDelay bool) error {
 		v = 1
 	}
 	// 注意：TCP_NODELAY 属于 IPPROTO_TCP 级别
-	if err := unix.SetsockoptInt(u.fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, v); err != nil {
+	if err := unix.SetsockoptInt(int(u.fd), unix.IPPROTO_TCP, unix.TCP_NODELAY, v); err != nil {
 		return u.wrapError("SetNoDelay", "tcp", os.NewSyscallError("SetsockoptInt", err))
 	}
 	return nil
@@ -105,10 +105,10 @@ func (u *TCPURingConn) SetKeepAlivePeriod(d time.Duration) error {
 	}
 
 	// 同时设置两个 Socket 选项
-	if err := unix.SetsockoptInt(u.fd, unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, secs); err != nil {
+	if err := unix.SetsockoptInt(int(u.fd), unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, secs); err != nil {
 		return u.wrapError("SetKeepAlivePeriod", "tcp", os.NewSyscallError("SetsockoptInt", err))
 	}
-	if err := unix.SetsockoptInt(u.fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, secs); err != nil {
+	if err := unix.SetsockoptInt(int(u.fd), unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, secs); err != nil {
 		return u.wrapError("SetKeepAlivePeriod", "tcp", os.NewSyscallError("SetsockoptInt", err))
 	}
 	return nil
@@ -131,7 +131,7 @@ func (u *TCPURingConn) SetKeepAliveConfig(config net.KeepAliveConfig) error {
 			if secs <= 0 {
 				secs = 1
 			}
-			if err := unix.SetsockoptInt(u.fd, unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, secs); err != nil {
+			if err := unix.SetsockoptInt(int(u.fd), unix.IPPROTO_TCP, unix.TCP_KEEPIDLE, secs); err != nil {
 				return u.wrapError("SetKeepAlivePeriod", "tcp", os.NewSyscallError("SetsockoptInt", err))
 			}
 		}
@@ -142,14 +142,14 @@ func (u *TCPURingConn) SetKeepAliveConfig(config net.KeepAliveConfig) error {
 			if secs <= 0 {
 				secs = 1
 			}
-			if err := unix.SetsockoptInt(u.fd, unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, secs); err != nil {
+			if err := unix.SetsockoptInt(int(u.fd), unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, secs); err != nil {
 				return u.wrapError("SetKeepAlivePeriod", "tcp", os.NewSyscallError("SetsockoptInt", err))
 			}
 		}
 
 		// 4. 设置 Count (对应 TCP_KEEPCNT)
 		if config.Count > 0 {
-			if err := unix.SetsockoptInt(u.fd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, config.Count); err != nil {
+			if err := unix.SetsockoptInt(int(u.fd), unix.IPPROTO_TCP, unix.TCP_KEEPCNT, config.Count); err != nil {
 				return u.wrapError("SetKeepAlivePeriod", "tcp", os.NewSyscallError("SetsockoptInt", err))
 			}
 		}
@@ -161,7 +161,7 @@ func (u *TCPURingConn) CloseRead() error {
 	if u.isUDP() {
 		return u.wrapProtocolError("CloseRead")
 	}
-	if err := unix.Shutdown(u.fd, unix.SHUT_RD); err != nil {
+	if err := unix.Shutdown(int(u.fd), unix.SHUT_RD); err != nil {
 		return u.wrapError("CloseRead", "tcp", os.NewSyscallError("Shutdown", err))
 	}
 	return nil
@@ -171,7 +171,7 @@ func (u *TCPURingConn) CloseWrite() error {
 	if u.isUDP() {
 		return u.wrapProtocolError("CloseWrite")
 	}
-	if err := unix.Shutdown(u.fd, unix.SHUT_WR); err != nil {
+	if err := unix.Shutdown(int(u.fd), unix.SHUT_WR); err != nil {
 		return u.wrapError("CloseWrite", "tcp", os.NewSyscallError("Shutdown", err))
 	}
 

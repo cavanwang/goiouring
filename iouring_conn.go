@@ -111,7 +111,7 @@ func NewUringUDPConn(rawConn net.PacketConn, manager *UringManager) (net.PacketC
 	if err := rawConn.Close(); err != nil {
 		return nil, err
 	}
-	fd := int(f.Fd())
+	fd := int32(f.Fd())
 
 	// 【修复点】不再调用 rawConn.Close()。
 	// tc.File() 已经分离了 FD 状态，此时 Close 原连接会导致底层 socket 状态异常触发 EBADF。
@@ -417,21 +417,21 @@ func (u *UringConn) Read(b []byte) (n int, err error) {
 }
 
 func (u *UringConn) SetReadBuffer(bytes int) error {
-	return unix.SetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_RCVBUF, bytes)
+	return unix.SetsockoptInt(int(u.fd), unix.SOL_SOCKET, unix.SO_RCVBUF, bytes)
 }
 
 // SetWriteBuffer 设置内核套接字发送缓冲区大小
 func (u *UringConn) SetWriteBuffer(bytes int) error {
 	// 强制限制：Linux 内核会对这个值进行翻倍，以预留出 sk_buff 结构开销
-	return unix.SetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, bytes)
+	return unix.SetsockoptInt(int(u.fd), unix.SOL_SOCKET, unix.SO_SNDBUF, bytes)
 }
 
 func (u *UringConn) GetWriteBuffer() (int, error) {
-	return unix.GetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
+	return unix.GetsockoptInt(int(u.fd), unix.SOL_SOCKET, unix.SO_SNDBUF)
 }
 
 func (u *UringConn) GetReadBuffer() (int, error) {
-	return unix.GetsockoptInt(u.fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
+	return unix.GetsockoptInt(int(u.fd), unix.SOL_SOCKET, unix.SO_RCVBUF)
 }
 
 func (u *UringConn) Close() error {

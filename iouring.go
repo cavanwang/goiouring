@@ -38,10 +38,11 @@ const (
 	IORING_OP_SENDMSG = 14 // UDP 高性能异步发送核心操作码
 	IORING_OP_RECVMSG = 17
 
-	IOSQE_FIXED_FILE  = 1 << 0 // 1
-	IOSQE_IO_DRAIN    = 1 << 1 // 2
-	IOSQE_IO_LINK     = 1 << 2 // 将当前 SQE 与下一个 SQE 强链锁绑定（超时必加）
-	IOSQE_IO_HARDLINK = 1 << 3 // 8
+	IOSQE_FIXED_FILE     = 1 << 0 // 1
+	IOSQE_IO_DRAIN       = 1 << 1 // 2
+	IOSQE_IO_LINK        = 1 << 2 // 将当前 SQE 与下一个 SQE 强链锁绑定（超时必加）
+	IOSQE_IO_HARDLINK    = 1 << 3 // 8
+	IORING_ENTER_EXT_ARG = 1 << 3 // 告诉内核我们传入了扩展的时间参数
 )
 
 const (
@@ -145,6 +146,14 @@ type Ring struct {
 	closeCh chan struct{}
 }
 
+// 🔥 【新增】严格对齐 Linux 内核的 io_uring_getevents_arg 结构体
+type ioUringGeteventsArg struct {
+	Sigmask   uint64
+	SigmaskSz uint32
+	Pad       uint32
+	Ts        uint64 // 指向 unix.Timespec 的用户态物理指针
+}
+
 func init() {
 	// 强行在编译/初始化阶段校验结构体大小，防止 32/64 位对齐产生 Padding 导致内核读错内存
 	if unsafe.Sizeof(SQE{}) != 64 {
@@ -232,8 +241,8 @@ func (r *Ring) PushTask(task *IOTask) {
 // --- 2. 核心发动机：单一协程掌控的 startPollToDoTasks (结合 Channel 和 Timer) ---
 func (r *Ring) startPollToDoTasks() {
 	// 将当前协程死死绑定在一个固定的内核线程上，极大加速系统调用进出效率
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	//runtime.LockOSThread()
+	//defer runtime.UnlockOSThread()
 
 	const tickInterval = 100 * 1000 // 100微秒超时兜底
 	var unsubmitted uint32
@@ -361,9 +370,9 @@ func (r *Ring) flushAndEnter(toSubmit uint32) {
 
 // --- 3. 接收端：单一协程掌控的 startPollDoneTasks (O(1) 指针转回与解耦唤醒) ---
 func (r *Ring) startPollDoneTasks() {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	// 保持解除 LockOSThread 状态，让 Go 弹性调度
 
+	// 💡 彻底抛弃内核高频 timespec 结构体，消灭内核定时器开销
 	for {
 		head := atomic.LoadUint32(r.cqHead)
 		tail := atomic.LoadUint32(r.cqTail)
@@ -391,7 +400,7 @@ func (r *Ring) startPollDoneTasks() {
 			continue
 		}
 
-		// 批处理：疯狂扫光当前 CQ 环里积攒的所有内核已完成事件
+		// 批处理收割逻辑（保持你的快照收割）
 		for head != tail {
 			index := head & *r.cqMask
 			cqe := r.cqes[index]

@@ -9,8 +9,6 @@ import (
 	_ "net/http/pprof"
 	"sync/atomic"
 	"time"
-
-	"github.com/cavanwang/goiouring"
 )
 
 func main() {
@@ -29,10 +27,10 @@ func main() {
 	}
 	defer l.Close()
 
-	mgr, err := goiouring.NewUringManager(1024, 1024*50)
+	/*mgr, err := goiouring.NewUringManager(1024, 1024*50)
 	if err != nil {
 		panic(err)
-	}
+	}*/
 	var t atomic.Int64
 	var lastPairs int64
 	go func() {
@@ -49,10 +47,10 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		conn, err = goiouring.NewUringConn(conn, mgr)
+		/*conn, err = goiouring.NewUringConn(conn, mgr)
 		if err != nil {
 			panic(err)
-		}
+		}*/
 		go func(conn net.Conn) {
 			defer conn.Close()
 			b := make([]byte, 1024)

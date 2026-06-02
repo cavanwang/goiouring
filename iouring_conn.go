@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -326,6 +327,10 @@ func (u *UringConn) Read(b []byte) (n int, err error) {
 
 	// 6. 擦干净，还给对象池
 	ioTaskPool.Put(task)
+
+	if n == 0 && err == nil {
+		err = io.EOF
+	}
 
 	return n, err
 }

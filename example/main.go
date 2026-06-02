@@ -6,9 +6,9 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"time"
-
 	_ "net/http/pprof"
+	"sync/atomic"
+	"time"
 
 	"github.com/cavanwang/goiouring"
 )
@@ -29,13 +29,21 @@ func main() {
 	}
 	defer l.Close()
 
-	ring, err := goiouring.NewRing(4)
+	mgr, err := goiouring.NewUringManager(1024, 1024*50)
 	if err != nil {
 		panic(err)
 	}
-	pool := goiouring.NewMultiPool()
-	mgr := goiouring.NewUringManager(ring, pool, time.Second*5, 64)
+	var t atomic.Int64
+	var lastPairs int64
+	go func() {
+		for {
+			time.Sleep(time.Second * 2)
+			log.Printf("total read/write pairs = %d/s", (t.Load()-lastPairs)/2)
+			lastPairs = t.Load()
+		}
+	}()
 
+	var lastT atomic.Int64
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -53,20 +61,23 @@ func main() {
 				n, err := conn.Read(b)
 				if err != nil {
 					if errors.Is(err, io.EOF) {
+						log.Printf("read %d bytes EOF", n)
 						return
 					}
 					panic(err)
 				}
 				i++
-				if i%1000 == 0 {
-					log.Printf("conn=%p i=%d read %d bytes: %s\n", conn, i, n, b[:n])
-				}
 				n, err = conn.Write(b[:n])
 				if err != nil {
 					panic(err)
 				}
-				if i%1000 == 0 {
-					log.Printf("conn=%p i=%d write %d bytes: %s\n", conn, i, n, b[:n])
+				t.Add(1)
+				now := time.Now().Unix()
+				old := lastT.Load()
+				if now-old > 5 {
+					if lastT.CompareAndSwap(old, now) {
+						log.Printf("conn=%p i=%d write %d bytes: %s\n", conn, i, n, b[:min(n, 10)])
+					}
 				}
 			}
 		}(conn)

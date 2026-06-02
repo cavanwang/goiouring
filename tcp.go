@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -213,89 +212,93 @@ func (u *TCPURingConn) MultipathTCP() (bool, error) {
 // WriteTo 将连接中的所有数据写入 w，直到连接关闭或发生错误。
 // 这是对 io.WriterTo 接口的实现，常被 io.Copy 调用以触发零拷贝。
 func (u *TCPURingConn) WriteTo(w io.Writer) (n int64, err error) {
-	// 1. 尝试获取目标的 FD
-	type fdGetter interface{ Fd() uintptr }
-	dstObj, ok := w.(fdGetter)
-	if !ok {
-		// 如果目标不是 FD 类型的（比如 bytes.Buffer），回退到标准 io.Copy
-		// 这里的 struct{ io.Reader }{u} 是为了避免 io.Copy 再次触发本函数导致死循环
-		return io.Copy(struct{ io.Writer }{w}, struct{ io.Reader }{u})
-	}
-	dstFd := int(dstObj.Fd())
-
-	// 2. 创建一个中间管道（Pipe）用于 Splice
-	// io_uring 的 splice 必须经过 pipe，这是内核 zero-copy 的中转站
-	var fds [2]int
-	if err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
-		return 0, os.NewSyscallError("pipe2", err)
-	}
-	pr, pw := fds[0], fds[1]
-	defer unix.Close(pr)
-	defer unix.Close(pw)
-
-	var written int64
-	for {
-		// 第一步：从 u.fd (Socket) Splice 到 pw (Pipe Write)
-		// 尝试读取最大 1MB（或管道默认限制）
-		n1, err := u.splice(u.fd, int32(pw), 1024*1024)
-		if err != nil {
-			// 如果连接已关闭，splice 可能返回这些错误，视为 EOF
-			if errors.Is(err, io.EOF) || errors.Is(err, unix.EBADF) || errors.Is(err, unix.ENOTCONN) {
-				break
-			}
-			return written, err
+	/*
+		// 1. 尝试获取目标的 FD
+		type fdGetter interface{ Fd() uintptr }
+		dstObj, ok := w.(fdGetter)
+		if !ok {
+			// 如果目标不是 FD 类型的（比如 bytes.Buffer），回退到标准 io.Copy
+			// 这里的 struct{ io.Reader }{u} 是为了避免 io.Copy 再次触发本函数导致死循环
+			return io.Copy(struct{ io.Writer }{w}, struct{ io.Reader }{u})
 		}
-		if n1 == 0 {
-			break
-		}
+		dstFd := int(dstObj.Fd())
 
-		// 第二步：从 pr (Pipe Read) Splice 到 dstFd (Target)
-		// 必须把刚才进管道的数据全部导出来
-		left := n1
-		for left > 0 {
-			n2, err := u.splice(int32(pr), int32(dstFd), uint32(left))
+		// 2. 创建一个中间管道（Pipe）用于 Splice
+		// io_uring 的 splice 必须经过 pipe，这是内核 zero-copy 的中转站
+		var fds [2]int
+		if err := unix.Pipe2(fds[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
+			return 0, os.NewSyscallError("pipe2", err)
+		}
+		pr, pw := fds[0], fds[1]
+		defer unix.Close(pr)
+		defer unix.Close(pw)
+
+		var written int64
+		for {
+			// 第一步：从 u.fd (Socket) Splice 到 pw (Pipe Write)
+			// 尝试读取最大 1MB（或管道默认限制）
+			n1, err := u.splice(u.fd, int32(pw), 1024*1024)
 			if err != nil {
+				// 如果连接已关闭，splice 可能返回这些错误，视为 EOF
+				if errors.Is(err, io.EOF) || errors.Is(err, unix.EBADF) || errors.Is(err, unix.ENOTCONN) {
+					break
+				}
 				return written, err
 			}
-			left -= n2
-			written += int64(n2)
+			if n1 == 0 {
+				break
+			}
+
+			// 第二步：从 pr (Pipe Read) Splice 到 dstFd (Target)
+			// 必须把刚才进管道的数据全部导出来
+			left := n1
+			for left > 0 {
+				n2, err := u.splice(int32(pr), int32(dstFd), uint32(left))
+				if err != nil {
+					return written, err
+				}
+				left -= n2
+				written += int64(n2)
+			}
 		}
-	}
-	return written, nil
+		return written, nil*/
+	return 0, nil
 }
 
 // splice 是对 IORING_OP_SPLICE 的底层封装
 // 建议参数统一用 int，方便与 Go 标准库（如 Pipe, File.Fd()）对接
 func (u *TCPURingConn) splice(inFd, outFd int32, nbytes uint32) (int, error) {
-	id := atomic.AddUint64(&u.manager.requestID, 1)
-	ch := readResultChanPool.Get().(chan Result)
-	u.manager.pending.Store(id, &requestCtx{resCh: ch})
+	/*
+		id := atomic.AddUint64(&u.manager.requestID, 1)
+		ch := readResultChanPool.Get().(chan Result)
+		u.manager.pending.Store(id, &requestCtx{resCh: ch})
 
-	u.manager.mu.Lock()
-	sqes := u.getSQEsBlocking(1)
-	sqe := sqes[0]
+		u.manager.mu.Lock()
+		sqes := u.getSQEsBlocking(1)
+		sqe := sqes[0]
 
-	// 关键修正：直接透传 inFd 和 outFd，不要在 fill 函数里写死 u.fd
-	// 这样 WriteTo 调用 splice(u.fd, pipeW, ...)
-	// 而 ReadFrom 调用 splice(pipeR, u.fd, ...) 都能正常工作
-	u.fillSpliceSQE(sqe, inFd, outFd, nbytes, id)
+		// 关键修正：直接透传 inFd 和 outFd，不要在 fill 函数里写死 u.fd
+		// 这样 WriteTo 调用 splice(u.fd, pipeW, ...)
+		// 而 ReadFrom 调用 splice(pipeR, u.fd, ...) 都能正常工作
+		u.fillSpliceSQE(sqe, inFd, outFd, nbytes, id)
 
-	if err := u.manager.ring.Submit(1); err != nil {
+		if err := u.manager.ring.Submit(1); err != nil {
+			u.manager.mu.Unlock()
+			u.manager.pending.Delete(id)
+			return 0, err
+		}
 		u.manager.mu.Unlock()
-		u.manager.pending.Delete(id)
-		return 0, err
-	}
-	u.manager.mu.Unlock()
 
-	res := <-ch
-	readResultChanPool.Put(ch)
+		res := <-ch
+		readResultChanPool.Put(ch)
 
-	if res.Err != nil {
-		return 0, res.Err
-	}
+		if res.Err != nil {
+			return 0, res.Err
+		}
 
-	// 修正：res.N 是 int32，强转为 int 返回
-	return int(res.N), nil
+		// 修正：res.N 是 int32，强转为 int 返回
+		return int(res.N), nil */
+	return 0, nil
 }
 
 // ReadFrom 从 r 中读取数据并写入到 u 的连接中，直到 r 到达 EOF。

@@ -4,8 +4,8 @@ package goiouring
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"runtime"
@@ -31,13 +31,29 @@ var (
 	}
 
 	defaultManager *UringManager
-)
 
-const (
-	IOSQE_FIXED_FILE  = 1 << 0 // 1
-	IOSQE_IO_DRAIN    = 1 << 1 // 2
-	IOSQE_IO_LINK     = 1 << 2 // 4  <-- 正确值应该是 4
-	IOSQE_IO_HARDLINK = 1 << 3 // 8
+	ioTaskPool = sync.Pool{
+		New: func() interface{} {
+			return &IOTask{
+				// 每个 Task 自带一个容量为 1 的无锁通知管道
+				ResChan: make(chan int, 1),
+			}
+		},
+	}
+
+	// 全局的 IOTask 对象池 (针对 UDP 场景定制)
+	udpWriteTaskPool = sync.Pool{
+		New: func() interface{} {
+			return &IOTask{
+				ResChan: make(chan int, 1),
+				// 预分配足够的空间存放 sockaddr，避免每次都分配内存
+				SockAddr: make([]byte, 128),
+			}
+		},
+	}
+
+	ErrUnsupportedAddr = errors.New("unsupported address type, must be UDPAddr")
+	ErrBufferTooSmall  = errors.New("provided sockaddr buffer is too small")
 )
 
 // kernelTimespec 对应 Linux 内核定义的 __kernel_timespec。
@@ -68,32 +84,13 @@ type UringConn struct {
 	readTs        *kernelTimespec
 	writeTs       *kernelTimespec
 	fd            int32
-	manager       *UringManager
 	laddr         net.Addr
 	raddr         net.Addr
 	file          *os.File
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
-}
 
-func InitRing() {
-	fmt.Println("will calling NewRing")
-	r, err := NewRing(4096)
-	if err != nil {
-		fmt.Println("failed to create io_uring ring:", err.Error())
-		panic(err)
-	}
-	fmt.Println("will calling NewUringManager")
-	defaultManager = NewUringManager(r, NewMultiPool(), time.Millisecond, 100)
-	fmt.Println("done: calling NewUringManager")
-}
-
-func NewDefaultUringConn(rawConn net.Conn) (net.Conn, error) {
-	return NewUringConn(rawConn, defaultManager)
-}
-
-func NewDefaultUringUDPConn(rawConn net.PacketConn) (net.PacketConn, error) {
-	return NewUringUDPConn(rawConn, defaultManager)
+	r *Ring
 }
 
 func NewUringUDPConn(rawConn net.PacketConn, manager *UringManager) (net.PacketConn, error) {
@@ -113,13 +110,9 @@ func NewUringUDPConn(rawConn net.PacketConn, manager *UringManager) (net.PacketC
 	}
 	fd := int32(f.Fd())
 
-	// 【修复点】不再调用 rawConn.Close()。
-	// tc.File() 已经分离了 FD 状态，此时 Close 原连接会导致底层 socket 状态异常触发 EBADF。
-	// 原 rawConn 将随对象生命周期结束被 GC。
-
 	c := &UringConn{
 		fd:      fd,
-		manager: manager,
+		r:       manager.GetRingForFD(int32(fd)),
 		file:    f,
 		laddr:   laddr,
 		readTs:  new(kernelTimespec),
@@ -150,20 +143,15 @@ func NewUringConn(rawConn net.Conn, manager *UringManager) (net.Conn, error) {
 	fd := int(f.Fd())
 	log.Info("rawconn.close called")
 
-	// 【修复点】不再调用 rawConn.Close()。
-	// tc.File() 已经分离了 FD 状态，此时 Close 原连接会导致底层 socket 状态异常触发 EBADF。
-	// 原 rawConn 将随对象生命周期结束被 GC。
-
 	c := &UringConn{
 		fd:      int32(fd),
-		manager: manager,
 		file:    f,
 		laddr:   laddr,
 		raddr:   raddr,
 		readTs:  new(kernelTimespec),
 		writeTs: new(kernelTimespec),
+		r:       manager.GetRingForFD(int32(fd)),
 	}
-	c.Write(nil)
 	runtime.KeepAlive(c.readTs)
 	runtime.KeepAlive(c.writeTs)
 	return c, nil
@@ -192,61 +180,46 @@ func (u *UringConn) File() (*os.File, error) {
 	return u.file, nil
 }
 
+var (
+	readTimes  atomic.Int64
+	writeTimes atomic.Int64
+)
+
 func (u *UringConn) Write(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
+	task := ioTaskPool.Get().(*IOTask)
 
-	hasTimeout := u.fillTs(u.writeTs, u.writeDeadline.Load())
+	task.OpCode = IORING_OP_SEND
+	task.Fd = u.fd
+	task.Buf = b
+	task.Offset = 0
+	task.Err = nil
 
-	bufPtr := u.manager.bufPool.Get(len(b))
-	//log.Debug("Write: %v bufPtr=%p bufPtr.len =%d idx=%d len(b)=%d", u.RemoteAddr(), bufPtr, len(*bufPtr), poolIdx, len(b))
-	copy((*bufPtr)[:len(b)], b)
-	*bufPtr = (*bufPtr)[:len(b)]
-
-	id := atomic.AddUint64(&u.manager.requestID, 1)
-	u.manager.pending.Store(id, &requestCtx{
-		bufPtr: bufPtr,
-	})
-
-	numSQEs := uint32(1)
+	ts, hasTimeout, tErr := convertDeadline(&u.writeDeadline)
+	if tErr != nil {
+		// 已超时错误直接拦截返回
+		udpWriteTaskPool.Put(task)
+		return 0, tErr
+	}
 	if hasTimeout {
-		numSQEs = 2
+		task.HasTimeout = 1
+		task.Timespec = ts
 	}
 
-	u.manager.mu.Lock()
-	sqes := u.getSQEsBlocking(numSQEs)
+	u.r.PushTask(task)
 
-	sqe := sqes[0]
-	sqe.Opcode = IORING_OP_WRITE
-	sqe.Fd = int32(u.fd)
-	//log.Debug("now Write for conn %v: bufPtr=%p bufPtr.len = %d len(b)=%d", u.RemoteAddr(), bufPtr, len(*bufPtr), len(b))
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&(*bufPtr)[0])))
-	sqe.Len = uint32(len(b))
-	sqe.UserData = id
+	// 等待内核把 TCP 缓冲区的数据发出去
+	n = <-task.ResChan
+	err = task.Err
 
-	if hasTimeout {
-		sqe.Flags |= IOSQE_IO_LINK
-		tsqe := sqes[1]
-		tsqe.Opcode = IORING_OP_LINK_TIMEOUT
-		tsqe.Fd = -1
-		tsqe.Addr = uint64(uintptr(unsafe.Pointer(u.writeTs)))
-		tsqe.Len = 1
-		tsqe.UserData = 0
-	}
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(task)
 
-	u.manager.ring.FlushSQEs(numSQEs)
-	if err := u.manager.ring.Submit(numSQEs); err != nil {
-		u.manager.mu.Unlock()
-		u.manager.pending.Delete(id)
-		//log.Debug("Write failed for conn %v put buf=%p, buflen=%d idx=%d: %v", u.RemoteAddr(), bufPtr, len(*bufPtr), poolIdx, err)
-		u.manager.bufPool.Put(bufPtr)
-		return 0, err
-	}
-	u.manager.mu.Unlock()
+	ioTaskPool.Put(task)
 
-	//log.Debug("Written for conn %v: bufPtr=%p bufPtr.len = %d idx=%d len(b)=%d", u.RemoteAddr(), bufPtr, len(*bufPtr), poolIdx, len(b))
-	return len(b), nil
+	return n, err
 }
 
 func (u *UringConn) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -254,169 +227,107 @@ func (u *UringConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		return 0, nil
 	}
 
-	hasTimeout := u.fillTs(u.writeTs, u.writeDeadline.Load())
-	bufPtr := u.manager.bufPool.Get(len(b))
-	copy((*bufPtr)[:len(b)], b)
+	// 1. 从对象池捞取 Task
+	task := udpWriteTaskPool.Get().(*IOTask)
+	task.Err = nil
+	task.HasTimeout = 0
 
-	sa, saLen, err := addrToSockaddr(addr)
+	task.Buf = b
+
+	// 2. 解析并持久化套接字地址
+	saLen, err := addrToSockaddr(addr, task.SockAddr)
 	if err != nil {
+		udpWriteTaskPool.Put(task)
 		return 0, err
 	}
 
-	id := atomic.AddUint64(&u.manager.requestID, 1)
-	iov := unix.Iovec{Base: &(*bufPtr)[0], Len: uint64(len(b))}
-	reqCtx := &requestCtx{
-		bufPtr: bufPtr,
-		msg: unix.Msghdr{
-			Name:    (*byte)(unsafe.Pointer(sa)),
-			Namelen: uint32(saLen),
-			Iov:     &iov,
-			Iovlen:  1,
-		},
+	// 3. 处理硬件超时
+	ts, hasTimeout, tErr := convertDeadline(&u.writeDeadline)
+	if tErr != nil {
+		udpWriteTaskPool.Put(task)
+		return 0, tErr
 	}
-
-	u.manager.pending.Store(id, reqCtx)
-
-	numSQEs := uint32(1)
 	if hasTimeout {
-		numSQEs = 2
+		task.HasTimeout = 1
+		task.Timespec = ts
 	}
 
-	u.manager.mu.Lock()
-	sqes := u.getSQEsBlocking(numSQEs)
+	// 4. 组装内存完美的 Msghdr
+	task.Iov.Base = &task.Buf[0]
+	task.Iov.Len = uint64(len(b))
 
-	sqe := sqes[0]
-	sqe.Opcode = IORING_OP_SENDMSG
-	sqe.Fd = int32(u.fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&reqCtx.msg)))
-	sqe.Len = 1
-	sqe.UserData = id
+	task.Msg.Name = (*byte)(unsafe.Pointer(&task.SockAddr[0]))
+	task.Msg.Namelen = uint32(saLen)
+	task.Msg.Iov = &task.Iov
+	task.Msg.Iovlen = 1
+	task.Msg.Control = nil
+	task.Msg.Controllen = 0
+	task.Msg.Flags = 0
 
-	if hasTimeout {
-		sqe.Flags |= IOSQE_IO_LINK
-		tsqe := sqes[1]
-		tsqe.Opcode = IORING_OP_LINK_TIMEOUT
-		tsqe.Fd = -1
-		tsqe.Addr = uint64(uintptr(unsafe.Pointer(u.writeTs)))
-		tsqe.Len = 1
-		tsqe.UserData = 0
+	// 5. 基础字段初始化
+	task.OpCode = IORING_OP_SENDMSG
+	task.Fd = int32(u.fd)
+
+	// 6. 【终极无锁推包】甩给后台发动机
+	u.r.PushTask(task)
+
+	// 7. 挂起等待内核 DMA 发送完毕信号
+	n := <-task.ResChan
+	resErr := task.Err
+
+	// 8. 保证安全防线（额外对 b 施加保护，防止极端优化下编译器提前回收切片底座）
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(task)
+
+	// 9. 资源安全回收
+	udpWriteTaskPool.Put(task)
+
+	if resErr != nil {
+		return 0, resErr
 	}
-
-	u.manager.ring.FlushSQEs(numSQEs)
-	if err := u.manager.ring.Submit(numSQEs); err != nil {
-		u.manager.mu.Unlock()
-		u.manager.pending.Delete(id)
-		u.manager.bufPool.Put(bufPtr)
-		return 0, err
-	}
-	u.manager.mu.Unlock()
-
-	return len(b), nil
+	return n, nil
 }
 
 func (u *UringConn) Read(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	// 强制让 b 逃逸到堆
-	runtime.KeepAlive(&b[0])
+	// 1. 从对象池捞一个干净的 IOTask
+	task := ioTaskPool.Get().(*IOTask)
 
-	// 1. 获取调用栈，查明是谁在调用 Read
-	//st := make([]byte, 2048)
-	//nn := runtime.Stack(st, false)
-	//log.Debug("[Read][Trace] Call Stack:\n%s", st[:nn])
+	// 2. 严格初始化该 Task 的内核所需字段
+	task.OpCode = IORING_OP_READ
+	task.Fd = u.fd
+	task.Buf = b
+	task.Offset = 0 // 网络 I/O 偏移量一律填 0
+	task.Err = nil  // 必须重置错误，防止上一次复用的残留
 
-	// 2. 核心状态检查：验证 FD 是否已被意外关闭
-	// F_GETFL 如果返回错误，说明 FD 已经失效（Bad File Descriptor）
-	//fl, fcntlErr := unix.FcntlInt(uintptr(u.fd), unix.F_GETFL, 0)
-	//if fcntlErr != nil {
-	//	log.Debug("[Read][Critical] FD %d is INVALID before SQE prep: %v", u.fd, fcntlErr)
-	//} else {
-	//	log.Debug("[Read][Status] FD %d is VALID, Flags: %d, Remote: %v", u.fd, fl, u.RemoteAddr())
-	//}
-
-	// 3. 准备超时和 ID
-	hasTimeout := u.fillTs(u.readTs, u.readDeadline.Load())
-	id := atomic.AddUint64(&u.manager.requestID, 1)
-	ch := readResultChanPool.Get().(chan Result)
-	u.manager.pending.Store(id, &requestCtx{resCh: ch})
-
-	numSQEs := uint32(1)
+	ts, hasTimeout, tErr := convertDeadline(&u.readDeadline)
+	if tErr != nil {
+		udpReadTaskPool.Put(task)
+		return 0, tErr
+	}
 	if hasTimeout {
-		numSQEs = 2
+		task.HasTimeout = 1
+		task.Timespec = ts
 	}
 
-	u.manager.mu.Lock()
-	sqes := u.getSQEsBlocking(numSQEs)
+	// 3. 将任务推入 startPollToDoTasks 的待办管道
+	u.r.PushTask(task)
 
-	//log.Debug("DEBUG: SQE0 Addr: %p, SQE1 Addr: %p, Diff: %d", sqes[0], sqes[1], uintptr(unsafe.Pointer(sqes[1]))-uintptr(unsafe.Pointer(sqes[0])))
+	// 4. 【致命阻塞点】当前业务协程在此挂起，把 CPU 让给别人。
+	// 当 startPollDoneTasks 收割到内核的 CQE 后，会通过这个 Channel 唤醒我们
+	n = <-task.ResChan
+	err = task.Err
 
-	// 4. 填充 READ SQE
-	sqe := sqes[0]
-	*sqe = SQE{} // 彻底清空槽位
-	sqe.Opcode = IORING_OP_READ
-	sqe.Fd = int32(u.fd)
-	sqe.Addr = uint64(uintptr(unsafe.Pointer(&b[0])))
-	sqe.Len = uint32(len(b))
-	sqe.UserData = id
-	if hasTimeout {
-		sqe.Flags |= IOSQE_IO_LINK
-	}
+	// 5. 【护城河】确保在拿到结果前，buf 和 task 绝对不被 GC 动弹或做栈重排
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(task)
 
-	//log.Debug("[Read][SQE0] Op: READ, FD: %d, Addr: 0x%x, Len: %d, Flags: %d, UserData: %d",
-	//	sqe.Fd, sqe.Addr, sqe.Len, sqe.Flags, sqe.UserData)
+	// 6. 擦干净，还给对象池
+	ioTaskPool.Put(task)
 
-	// 5. 填充 LINK_TIMEOUT SQE
-	if hasTimeout {
-		tsqe := sqes[1]
-		*tsqe = SQE{}
-		tsqe.Opcode = IORING_OP_LINK_TIMEOUT
-		//tsqe.Opcode = 0
-		tsqe.Fd = -1 // 必须是 -1
-		tsqe.Addr = uint64(uintptr(unsafe.Pointer(u.readTs)))
-		tsqe.Len = 1
-		tsqe.UserData = 0
-
-		//log.Debug("[Read][SQE1] tsqe Op: %d, FD: %d, Addr: 0x%x (Aligned8: %v), Off: %d",
-		//	tsqe.Opcode, tsqe.Fd, tsqe.Addr, tsqe.Addr%8 == 0, tsqe.Off)
-		//
-		//log.Debug("[Read][SQE1] Op: LINK_TIMEOUT, FD: %d, Addr(Ts): 0x%x, Len: %d, Val: %+v",
-		//	tsqe.Fd, tsqe.Addr, tsqe.Len, u.readTs)
-	}
-
-	// 6. 提交到环
-	u.manager.ring.FlushSQEs(numSQEs)
-	submitErr := u.manager.ring.Submit(numSQEs)
-	u.manager.mu.Unlock()
-
-	if submitErr != nil {
-		u.manager.pending.Delete(id)
-		//log.Debug("[Read][Error] io_uring submit failed: %v", submitErr)
-		return 0, submitErr
-	}
-	//log.Debug("[Read][Submit] ID %d submitted successfully, waiting for CQE...", id)
-
-	// 7. 等待结果
-	res := <-ch
-	readResultChanPool.Put(ch)
-
-	// 8. 结果诊断日志
-	if res.Err != nil {
-		log.Debug("[Read][Result] FAILED: ID %d, N: %d, Err: %v", id, res.N, res.Err)
-		// 如果还是 EBADF，查看这一瞬间 FD 是否还活着
-		//_, fcntlErr2 := unix.FcntlInt(uintptr(u.fd), unix.F_GETFL, 0)
-		//log.Debug("[Read][Post-Mortem] FD %d alive check: %v", u.fd, fcntlErr2)
-	} else {
-		//log.Debug("[Read][Result] SUCCESS: ID %d, N: %d", id, res.N)
-	}
-
-	// 强制保持连接对象不被回收
-	runtime.KeepAlive(u)
-
-	if res.Err == nil && res.N == 0 {
-		res.Err = io.EOF
-	}
-	return res.N, res.Err
+	return n, err
 }
 
 func (u *UringConn) SetReadBuffer(bytes int) error {
@@ -438,30 +349,8 @@ func (u *UringConn) GetReadBuffer() (int, error) {
 }
 
 func (u *UringConn) Close() error {
-	//b := make([]byte, 4096)
-	//nn := runtime.Stack(b, false)
 	log.Debug("will calling Close for conn v", u.RemoteAddr())
 	return u.file.Close()
-}
-
-func (u *UringConn) getSQEsBlocking(n uint32) []*SQE {
-	spin := 0
-	for {
-		sqes := u.manager.ring.GetSQEs(n)
-		if sqes != nil {
-			for i := range sqes {
-				*sqes[i] = SQE{}
-			}
-			return sqes
-		}
-		if spin < 10 {
-			spin++
-			runtime.Gosched()
-			continue
-		}
-		u.manager.ring.Submit(uint32(len(sqes)))
-		<-u.manager.sqeWaiter
-	}
 }
 
 func parseSockaddr(sa *unix.RawSockaddrAny) (net.Addr, error) {
@@ -478,25 +367,59 @@ func parseSockaddr(sa *unix.RawSockaddrAny) (net.Addr, error) {
 	return nil, fmt.Errorf("unsupported address family")
 }
 
-func addrToSockaddr(addr net.Addr) (*unix.RawSockaddrAny, uint32, error) {
-	udp, ok := addr.(*net.UDPAddr)
+// addrToSockaddr 将 Go 的 net.Addr 零分配地写入传入的 saBuf 中
+// 返回值 saLen 代表实际塞入内核的结构体大小 (IPv4=16, IPv6=28)
+func addrToSockaddr(addr net.Addr, saBuf []byte) (saLen int, err error) {
+	// 1. 强转为 *net.UDPAddr (代理/UDP 转发场景下几乎全是 UDPAddr)
+	udpAddr, ok := addr.(*net.UDPAddr)
 	if !ok {
-		return nil, 0, fmt.Errorf("only UDP supported")
+		return 0, ErrUnsupportedAddr
 	}
 
-	if ip4 := udp.IP.To4(); ip4 != nil {
-		sa := new(unix.RawSockaddrInet4)
-		sa.Family = unix.AF_INET
-		binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&sa.Port))[:], uint16(udp.Port))
-		copy(sa.Addr[:], ip4)
-		return (*unix.RawSockaddrAny)(unsafe.Pointer(sa)), unix.SizeofSockaddrInet4, nil
+	ip := udpAddr.IP
+	port := udpAddr.Port
+
+	// 2. 自动判定 IPv4 还是 IPv6
+	if ip4 := ip.To4(); ip4 != nil {
+		// IPv4 对应内核的 struct sockaddr_in (大小为 16 字节)
+		if len(saBuf) < 16 {
+			return 0, ErrBufferTooSmall
+		}
+		saLen = 16
+
+		// 强行把 saBuf 的前 16 字节解释为内核的 RawSockaddrInet4 结构体
+		rsa := (*unix.RawSockaddrInet4)(unsafe.Pointer(&saBuf[0]))
+
+		// 严格按照 Linux 内核的大端序 (Big Endian) 填充字段
+		rsa.Family = unix.AF_INET
+		// 端口号：转换为网络字节序 (大端)
+		rsa.Port = uint16(port<<8) | uint16(port>>8)
+		// IP 地址：直接拷贝 4 个字节
+		copy(rsa.Addr[:], ip4)
+
+	} else if ip6 := ip.To16(); ip6 != nil {
+		// IPv6 对应内核的 struct sockaddr_in6 (大小为 28 字节)
+		if len(saBuf) < 28 {
+			return 0, ErrBufferTooSmall
+		}
+		saLen = 28
+
+		// 强行把 saBuf 的前 28 字节解释为内核的 RawSockaddrInet6 结构体
+		rsa := (*unix.RawSockaddrInet6)(unsafe.Pointer(&saBuf[0]))
+
+		rsa.Family = unix.AF_INET6
+		rsa.Port = uint16(port<<8) | uint16(port>>8)
+		// IPv6 还有两个特殊的 Scope 字段，默认填 0 即可
+		rsa.Flowinfo = 0
+		rsa.Scope_id = 0
+		// IP 地址：直接拷贝 16 个字节
+		copy(rsa.Addr[:], ip6)
+
+	} else {
+		return 0, ErrUnsupportedAddr
 	}
 
-	sa := new(unix.RawSockaddrInet6)
-	sa.Family = unix.AF_INET6
-	binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&sa.Port))[:], uint16(udp.Port))
-	copy(sa.Addr[:], udp.IP.To16())
-	return (*unix.RawSockaddrAny)(unsafe.Pointer(sa)), unix.SizeofSockaddrInet6, nil
+	return saLen, nil
 }
 
 // wrapProtocolError 统一封装协议不支持的错误
@@ -539,4 +462,24 @@ func (u *UringConn) fillTs(ts *kernelTimespec, t *time.Time) bool {
 	ts.tv_sec = int64(d.Seconds())
 	ts.tv_nsec = int64(d.Nanoseconds() % 1e9)
 	return true
+}
+
+// convertDeadline 将泛型原子指针 atomic.Pointer[time.Time] 转换为内核的 unix.Timespec。
+// 完全消灭了类型断言，依然是完美的 0 内存分配 (0 B/op) 且符合内联标准。
+func convertDeadline(p *atomic.Pointer[time.Time]) (ts unix.Timespec, hasTimeout bool, err error) {
+	// 1. 直接 Load 拿到 *time.Time 强类型指针
+	tPtr := p.Load()
+	if tPtr == nil || tPtr.IsZero() {
+		return unix.Timespec{}, false, nil
+	}
+
+	// 2. 计算相对剩余时间 (解引用获取 time.Time 对象)
+	d := time.Until(*tPtr)
+	if d <= 0 {
+		// 已经超时，立刻拦截
+		return unix.Timespec{}, false, unix.ETIMEDOUT
+	}
+
+	// 3. 数学转换
+	return unix.NsecToTimespec(d.Nanoseconds()), true, nil
 }

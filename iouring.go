@@ -7,12 +7,13 @@ import (
 	"math/bits"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// --- 内核常量定义 (x86_64) ---
+// --- Linux 内核 io_uring 系统调用与常量定义 (x86_64) ---
 const (
 	SYS_IO_URING_SETUP = 425
 	SYS_IO_URING_ENTER = 426
@@ -23,23 +24,33 @@ const (
 
 	IORING_FEAT_SINGLE_MMAP = 1 << 0
 	IORING_ENTER_GETEVENTS  = 1 << 0
+	IORING_OP_LINK_TIMEOUT  = 15 // 新增：超时操作码
+	IORING_OP_SPLICE        = 31 // 新增：Splice 操作码
 
 	// SQPOLL 相关标志
 	IORING_SETUP_SQPOLL    = 1 << 1 // 启用内核线程轮询
 	IORING_SQ_NEED_WAKEUP  = 1 << 0 // SQ 环 Flags 标志：内核线程已休眠，需唤醒
 	IORING_ENTER_SQ_WAKEUP = 1 << 1 // Enter 标志：唤醒内核线程
 
-	// 常用操作码
-	IORING_OP_READ         = 22
-	IORING_OP_WRITE        = 23
-	IORING_OP_LINK_TIMEOUT = 15 // 新增：超时操作码
-	IORING_OP_SPLICE       = 31 // 新增：Splice 操作码
-
+	// 支持的常用异步操作码
+	IORING_OP_SEND    = 26 // 针对已连接 Socket 的专用发送（相当于标准 BSD 的 send()）
+	IORING_OP_READ    = 22
+	IORING_OP_SENDMSG = 14 // UDP 高性能异步发送核心操作码
 	IORING_OP_RECVMSG = 17
-	IORING_OP_SENDMSG = 16
+
+	IOSQE_FIXED_FILE  = 1 << 0 // 1
+	IOSQE_IO_DRAIN    = 1 << 1 // 2
+	IOSQE_IO_LINK     = 1 << 2 // 将当前 SQE 与下一个 SQE 强链锁绑定（超时必加）
+	IOSQE_IO_HARDLINK = 1 << 3 // 8
 )
 
-// --- 结构体定义 ---
+const (
+	// 攒批触发系统调用的阈值
+	batchSize = 64
+)
+
+// --- 内存布局对齐结构体 (严格匹配 Linux 内核) ---
+
 type IOUringParams struct {
 	SqEntries, CqEntries, Flags, SqThreadCpu, SqThreadIdle, Features uint32
 	WqFd                                                             uint32
@@ -84,79 +95,84 @@ type CQE struct {
 	Flags    uint32
 }
 
+// --- 1. 工业级 IOTask 异步/同步转换桥梁 ---
+
+type IOTask struct {
+	OpCode uint8  // IORING_OP_READ 或 IORING_OP_WRITE
+	Fd     int32  // 网络连接或文件的 fd
+	Buf    []byte // 目标内存缓冲区 (直接暴露给内核执行 DMA)
+	Offset uint64 // 文件偏移量 (网络连接填 0)
+
+	// 核心纽带：容量必须为 1 的缓冲 Channel
+	// 当内核完成 I/O 后，PollDoneTasks 会往这里写入结果，瞬间唤醒挂起的业务协程
+	ResChan chan int
+	Err     error // 存放内核返回的错误原因
+
+	// --- UDP 专用特化字段 ---
+	Iov      unix.Iovec          // 持久化 iovec 结构体，防止进入内核后被栈释放
+	Msg      unix.Msghdr         // 持久化 msghdr 结构体
+	SockAddr []byte              // 持久化通用套接字地址 (addrToSockaddr 转换出的 raw 数据)
+	RawSa    unix.RawSockaddrAny // 专供内核异步回写对端来源 IP 和端口的物理槽位，防止栈扩容漂移
+
+	// --- 超时特化字段 ---
+	HasTimeout uint8         // 0: 无超时, 1: 有超时
+	Timespec   unix.Timespec // 独立持久化超时时间，防止多线程踩踏
+}
+
 type Ring struct {
 	fd     int
 	params IOUringParams
 
+	// SQ 环：仅限全局唯一的 startPollToDoTasks 协程读写，彻底告别多线程 atomic 锁竞争
 	sqPtr   []byte
-	sqHead  *uint32
-	sqTail  *uint32
+	sqHead  *uint32 // 内核写，用户读
+	sqTail  *uint32 // 用户写，内核读
 	sqMask  *uint32
-	sqFlags *uint32
 	sqArray []uint32
 	sqes    []SQE
 
+	localTail uint32 // startPollToDoTasks 独占的局部尾指针，用于无锁快速计算位置
+
+	// CQ 环：仅限全局唯一的 startPollPollDoneTasks 协程读写
 	cqPtr  []byte
-	cqHead *uint32
-	cqTail *uint32
+	cqHead *uint32 // 用户写，内核读
+	cqTail *uint32 // 内核写，用户读
 	cqMask *uint32
 	cqes   []CQE
 
-	maxEntries uint32
+	// 用户态的高效通信管道
+	jobChan chan *IOTask
+	closeCh chan struct{}
 }
 
 func init() {
-	var sqe SQE
-	var cqe CQE
-
-	// 1. 验证 SQE 总体大小 (必须 64 字节)
-	sqeSize := unsafe.Sizeof(sqe)
-	if sqeSize != 64 {
-		panic(fmt.Sprintf("[Critical] io_uring SQE struct size alignment error: got %d, expected 64", sqeSize))
+	// 强行在编译/初始化阶段校验结构体大小，防止 32/64 位对齐产生 Padding 导致内核读错内存
+	if unsafe.Sizeof(SQE{}) != 64 {
+		panic("[Critical] io_uring SQE struct size alignment error: expected 64")
 	}
-
-	// 2. 验证关键字段偏移量 (x86_64 标准布局)
-	// UserData 必须在第 32 字节（8字节对齐）
-	userDataOffset := unsafe.Offsetof(sqe.UserData)
-	if userDataOffset != 32 {
-		panic(fmt.Sprintf("[Critical] SQE.UserData offset error: got %d, expected 32. Potential padding issue!", userDataOffset))
-	}
-
-	// 3. 验证联合体起始位置
-	// BufIndex 紧跟在 UserData 之后 (32 + 8 = 40)
-	bufIndexOffset := unsafe.Offsetof(sqe.BufIndex)
-	if bufIndexOffset != 40 {
-		panic(fmt.Sprintf("[Critical] SQE.BufIndex offset error: got %d, expected 40", bufIndexOffset))
-	}
-
-	// 4. 验证 CQE 大小 (必须 16 字节)
-	cqeSize := unsafe.Sizeof(cqe)
-	if cqeSize != 16 {
-		panic(fmt.Sprintf("[Critical] io_uring CQE struct size alignment error: got %d, expected 16", cqeSize))
+	if unsafe.Sizeof(CQE{}) != 16 {
+		panic("[Critical] io_uring CQE struct size alignment error: expected 16")
 	}
 }
 
-// New 初始化 Ring
-func NewRing(entries uint32) (*Ring, error) {
-	entries = nextPowerOfTwo(entries)
+// NewRing 创建并初始化一个具有高性能双雄协程的 io_uring 引擎
+func NewRing(ringEntries uint32, taskChannelLen int) (*Ring, error) {
+	ringEntries = nextPowerOfTwo(ringEntries)
 
 	var p IOUringParams
-	//p.Flags = IORING_SETUP_SQPOLL
-	//p.SqThreadIdle = 2000
-	p.Flags = 0
-
-	fd, _, errno := unix.RawSyscall(SYS_IO_URING_SETUP, uintptr(entries), uintptr(unsafe.Pointer(&p)), 0)
+	fd, _, errno := unix.RawSyscall(SYS_IO_URING_SETUP, uintptr(ringEntries), uintptr(unsafe.Pointer(&p)), 0)
 	if errno != 0 {
 		return nil, fmt.Errorf("io_uring_setup error: %v", errno)
 	}
 
 	r := &Ring{
-		fd:         int(fd),
-		params:     p,
-		maxEntries: entries,
+		fd:      int(fd),
+		params:  p,
+		jobChan: make(chan *IOTask, taskChannelLen), // 缓冲管道，承载来自上游几百个业务协程的并发
+		closeCh: make(chan struct{}),
 	}
 
-	// SQ 映射
+	// 1. 映射 SQ 内存
 	sqSize := p.SqOff.Array + p.SqEntries*4
 	sqPtr, err := unix.Mmap(r.fd, IORING_OFF_SQ_RING, int(sqSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	if err != nil {
@@ -167,10 +183,9 @@ func NewRing(entries uint32) (*Ring, error) {
 	r.sqHead = (*uint32)(unsafe.Pointer(&sqPtr[p.SqOff.Head]))
 	r.sqTail = (*uint32)(unsafe.Pointer(&sqPtr[p.SqOff.Tail]))
 	r.sqMask = (*uint32)(unsafe.Pointer(&sqPtr[p.SqOff.RingMask]))
-	r.sqFlags = (*uint32)(unsafe.Pointer(&sqPtr[p.SqOff.Flags]))
 	r.sqArray = (*[1 << 28]uint32)(unsafe.Pointer(&sqPtr[p.SqOff.Array]))[:p.SqEntries]
 
-	// SQEs 映射
+	// 2. 映射 SQE 结构体数组
 	sqeSize := p.SqEntries * 64
 	sqePtr, err := unix.Mmap(r.fd, IORING_OFF_SQES, int(sqeSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED|unix.MAP_POPULATE)
 	if err != nil {
@@ -180,7 +195,7 @@ func NewRing(entries uint32) (*Ring, error) {
 	}
 	r.sqes = (*[1 << 26]SQE)(unsafe.Pointer(&sqePtr[0]))[:p.SqEntries]
 
-	// CQ 映射
+	// 3. 映射 CQ 内存 (判断内核是否支持 Single MMAP 优化)
 	if p.Features&IORING_FEAT_SINGLE_MMAP != 0 {
 		r.cqPtr = sqPtr
 	} else {
@@ -199,194 +214,240 @@ func NewRing(entries uint32) (*Ring, error) {
 	r.cqMask = (*uint32)(unsafe.Pointer(&r.cqPtr[p.CqOff.RingMask]))
 	r.cqes = (*[1 << 27]CQE)(unsafe.Pointer(&r.cqPtr[p.CqOff.Cqes]))[:p.CqEntries]
 
+	// 初始化局部尾指针快照
+	r.localTail = *r.sqTail
+
+	// --- 异步双雄并驾齐驱 ---
+	go r.startPollToDoTasks() // 优化更名：统一待提交任务管道轮询与攒批下发发动机
+	go r.startPollDoneTasks() // 优化更名：统一已完成任务结果收割与分发器
+
 	return r, nil
 }
 
-// GetSQE 获取单个槽位
-func (r *Ring) GetSQE() *SQE {
-	sqes := r.GetSQEs(1)
-	if sqes == nil {
-		return nil
-	}
-	return sqes[0]
+// PushTask 供上游业务 Goroutine 并发调用的非阻塞推包接口
+func (r *Ring) PushTask(task *IOTask) {
+	r.jobChan <- task
 }
 
-func (r *Ring) GetMaxEntries() uint32 {
-	return r.maxEntries
-}
+// --- 2. 核心发动机：单一协程掌控的 startPollToDoTasks (结合 Channel 和 Timer) ---
+func (r *Ring) startPollToDoTasks() {
+	// 将当前协程死死绑定在一个固定的内核线程上，极大加速系统调用进出效率
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-// GetSQEs 原子性地一次性预留 n 个连续槽位。
-// 该函数会直接更新 sqArray，但不会推进 sqTail（由 FlushSQE 处理）。
-func (r *Ring) GetSQEs(n uint32) []*SQE {
-	if n == 0 {
-		return nil
-	}
+	const tickInterval = 100 * 1000 // 100微秒超时兜底
+	var unsubmitted uint32
 
-	head := atomic.LoadUint32(r.sqHead)
-	tail := *r.sqTail // 假设调用方已持有管理器级别的锁
+	timer := unsafeNewTimer(tickInterval)
+	defer timer.Stop()
 
-	// 检查环是否有足够连续空间
-	if tail+n-head > r.params.SqEntries {
-		return nil
-	}
-
-	res := make([]*SQE, n)
-	for i := uint32(0); i < n; i++ {
-		// 计算当前逻辑位置对应的环索引
-		// io_uring 允许逻辑 tail 持续增长，通过 mask 取模定位物理数组位置
-		logicalIdx := tail + i
-		index := logicalIdx & *r.sqMask
-
-		// 1. 在 SQ 数组中建立逻辑位置到 SQE 数组索引的映射
-		// 注意：此处是 io_uring 要求的关键，内核通过读取 sqArray[logicalTail & mask] 找到 SQE
-		r.sqArray[index] = index
-
-		// 2. 获取 SQE 结构体引用
-		res[i] = &r.sqes[index]
-	}
-
-	return res
-}
-
-// FlushSQEs 批量更新尾指针，使内核看到新提交的 n 个任务
-func (r *Ring) FlushSQEs(n uint32) {
-	if n == 0 {
-		return
-	}
-
-	// 【关键修复】
-	// 虽然 atomic 在 x86 是全屏障，但在高性能 IO 场景下，
-	// 我们需要确保在更新 Tail 之前，所有的 SQE 字段（Fd, Addr 等）
-	// 已经从 CPU 寄存器刷到了能被内核线程看到的 Cache Line 中。
-
-	// 强制编译器不在此处进行指令重排
-	runtime.KeepAlive(r.sqes)
-
-	// 更新 Tail
-	atomic.AddUint32(r.sqTail, n)
-}
-
-// 修改 Submit 增加 n 参数，代表本次期望内核处理的任务数
-func (r *Ring) Submit(n uint32) error {
-	if r.params.Flags&IORING_SETUP_SQPOLL != 0 {
-		// SQPOLL 模式下，通常不需要 Enter，除非内核线程睡着了
-		if atomic.LoadUint32(r.sqFlags)&IORING_SQ_NEED_WAKEUP != 0 {
-			_, _, errno := unix.RawSyscall6(
-				SYS_IO_URING_ENTER,
-				uintptr(r.fd),
-				0, // to_submit (SQPOLL 模式下，内核自己会看，这里传0即可)
-				0, // min_complete
-				uintptr(IORING_ENTER_SQ_WAKEUP),
-				0, 0,
-			)
-			// EAGAIN 和 EINTR 是正常现象，不需要作为错误返回
-			if errno != 0 && errno != unix.EAGAIN && errno != unix.EINTR {
-				return errno
+	for {
+		select {
+		// 场景 A：待办任务管道有活干 (上游业务协程塞包进来了)
+		case task := <-r.jobChan:
+			// 1. 【修复】动态计算本次任务需要占据几个 SQE 槽位 (普通为 1，带超时则为 2)
+			numSQEs := uint32(1)
+			if task.HasTimeout == 1 {
+				numSQEs = 2
 			}
+
+			// 2. 【修复】精密环满检查：必须确保环内至少有满足 numSQEs 的空闲槽位
+			head := atomic.LoadUint32(r.sqHead)
+			if r.localTail+numSQEs-head > r.params.SqEntries {
+				// 环空间不够放当前整套任务了，强行把手里的存货 Flush 进内核提货
+				if unsubmitted > 0 {
+					r.flushAndEnter(unsubmitted)
+					unsubmitted = 0
+					unsafeResetTimer(timer, tickInterval)
+				}
+				// 暂时让出 P，给内核一点时间通过 DMA 消耗任务
+				runtime.Gosched()
+				head = atomic.LoadUint32(r.sqHead)
+				if r.localTail+numSQEs-head > r.params.SqEntries {
+					// 依然满则发起 0 提交系统调用进行强行阻尼
+					r.flushAndEnter(0)
+				}
+			}
+
+			// 3. 纯内存、无锁分配主任务 SQE 槽位
+			index := r.localTail & *r.sqMask
+			r.sqArray[index] = index
+			sqe := &r.sqes[index]
+
+			// 初始化主 SQE 的通用字段
+			sqe.Opcode = task.OpCode
+			sqe.Fd = task.Fd
+			sqe.Off = task.Offset
+			sqe.UserData = uint64(uintptr(unsafe.Pointer(task)))
+			sqe.Flags = 0 // 【修复】必须显式初始化 Flags
+
+			// 4. 【修复】核心微观分流：区分 TCP(字节流) 与 UDP(Msghdr套接字) 的内存物理拓扑
+			if task.OpCode == IORING_OP_READ || task.OpCode == IORING_OP_SEND {
+				// TCP / 文件：Addr 指向原始字节切片缓冲区
+				sqe.Addr = uint64(uintptr(unsafe.Pointer(&task.Buf[0])))
+				sqe.Len = uint32(len(task.Buf))
+			} else {
+				// UDP (SENDMSG / RECVMSG)：Addr 指向 task 身上的核心 Msghdr 物理底座
+				sqe.Addr = uint64(uintptr(unsafe.Pointer(&task.Msg)))
+				sqe.Len = 1 // 根据 Linux io_uring 规范，SENDMSG/RECVMSG 的 len 固定填 1
+			}
+
+			r.localTail++
+			unsubmitted++
+
+			// 5. 【新增】超时链接处理器：如果是带超时的请求，紧挨着塞入第二个超时链接 SQE
+			if task.HasTimeout == 1 {
+				// 核心防线：打上锁链标志，告诉内核当前主操作如果超时未动，直接由下面的超时操作接管斩断
+				sqe.Flags |= IOSQE_IO_LINK
+
+				nextIndex := r.localTail & *r.sqMask
+				r.sqArray[nextIndex] = nextIndex
+				tsqe := &r.sqes[nextIndex]
+
+				// 严格初始化内核级超时联动结构体
+				tsqe.Opcode = IORING_OP_LINK_TIMEOUT
+				tsqe.Fd = -1                                                // 固定填 -1
+				tsqe.Addr = uint64(uintptr(unsafe.Pointer(&task.Timespec))) // 指向 task 身上的相对剩余时间
+				tsqe.Len = 1                                                // 代表 1 个 timespec 结构体
+				tsqe.Off = 0
+				tsqe.UserData = 0 // 超时触发本身内核会自动熔断前一个主 SQE，这里不需要给完成环回执，填 0 即可
+				tsqe.Flags = 0
+
+				r.localTail++
+				unsubmitted++
+			}
+
+			// 6. 攒批数量达到黄金阈值 64，立刻批量进内核触发真正的硬件 DMA
+			if unsubmitted >= batchSize {
+				r.flushAndEnter(unsubmitted)
+				unsubmitted = 0
+				unsafeResetTimer(timer, tickInterval)
+			}
+
+		// 场景 B：超时兜底机制触发 (流量低谷期，手里攒了几个任务但不够64个)
+		case <-timer.C:
+			if unsubmitted > 0 {
+				r.flushAndEnter(unsubmitted)
+				unsubmitted = 0
+			}
+			unsafeResetTimer(timer, tickInterval)
+
+		// 场景 C：网关关闭
+		case <-r.closeCh:
+			return
 		}
-		return nil
+	}
+}
+
+// flushAndEnter 统一的指针合拢与唯一系统调用下发入口
+func (r *Ring) flushAndEnter(toSubmit uint32) {
+	if toSubmit > 0 {
+		// 阻断编译器优化重排，确保内核看到 sqTail 推进前，SQE 各字段已被全刷入 CPU Cache Line
+		runtime.KeepAlive(r.sqes)
+		// 纯单线程内存操作推进物理尾指针，消灭多核心多线程 CAS 造成的 Cache 踩踏
+		*r.sqTail = r.localTail
 	}
 
-	// 非 SQPOLL 模式：显式告知内核处理 n 个任务
-	// 如果 n 为 0，内核也会检查环，但传 n 效率更高
-	_, _, errno := unix.RawSyscall6(
-		SYS_IO_URING_ENTER,
+	// 触发整个转发链路唯一的内核系统调用
+	_, _, _ = unix.Syscall6(
+		unix.SYS_IO_URING_ENTER,
 		uintptr(r.fd),
-		uintptr(n), // to_submit
-		0,          // min_complete (WaitCQE 里会处理这个，这里传0)
-		0,
+		uintptr(toSubmit),
+		0, // min_complete = 0 (ToDoTasks 只管发，不管等，收割任务交给专职的 DoneTasks 协程)
+		0, // flags
 		0, 0,
 	)
-
-	if errno != 0 && errno != unix.EAGAIN && errno != unix.EINTR {
-		return errno
-	}
-	return nil
 }
 
-func (r *Ring) Close() {
-	_ = unix.Close(r.fd)
-}
+// --- 3. 接收端：单一协程掌控的 startPollDoneTasks (O(1) 指针转回与解耦唤醒) ---
+func (r *Ring) startPollDoneTasks() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-// WaitCQE 阻塞等待完成事件
-func (r *Ring) WaitCQE() (userData uint64, res int32, err error) {
-	// 策略 1：极短时间的原子自旋 (Spinning)
-	// 适合处理已经在内核中完成或即将完成的任务
-	for i := 0; i < 100; i++ {
+	for {
 		head := atomic.LoadUint32(r.cqHead)
 		tail := atomic.LoadUint32(r.cqTail)
 
-		if head != tail {
-			return r.extractCQE(head)
-		}
-		// 这里不需要 PAUSE 汇编，紧凑的原子 Load 在 x86 下已经足够高效
-	}
-
-	// 策略 2：协作式让出 (Yielding)
-	// 如果自旋没拿到，说明 IO 还没好。
-	// 我们调用 Gosched 让出当前 P 给其他 Goroutine 运行。
-	// 这比直接进内核 Syscall 要轻量，如果此时 P 队列有活，CPU 不会闲着。
-	runtime.Gosched()
-
-	// 再次检查一遍，万一在 Gosched 期间 IO 好了
-	head := atomic.LoadUint32(r.cqHead)
-	tail := atomic.LoadUint32(r.cqTail)
-	if head != tail {
-		return r.extractCQE(head)
-	}
-
-	// 策略 3：阻塞式休眠 (Blocking)
-	// 走到这一步说明 IO 确实是“慢速”的（比如网络等待）。
-	// 调用 Syscall 进入内核等待队列，彻底挂起当前线程，不消耗任何 CPU。
-	for {
-		_, _, errno := unix.Syscall6(
-			unix.SYS_IO_URING_ENTER,
-			uintptr(r.fd),
-			0, // to_submit
-			1, // min_complete: 至少等 1 个事件
-			uintptr(IORING_ENTER_GETEVENTS),
-			0, 0,
-		)
-
-		if errno != 0 {
-			if errno == unix.EINTR || errno == unix.EAGAIN {
-				continue
+		// 如果完成环空空如也，说明当前没有已完成的 I/O 事件
+		if head == tail {
+			// 发起一个特殊的 enter 系统调用：不提交任务(0)，但要求至少卡住等 1 个完成事件(1)
+			// 当前 DoneTasks 线程会进入内核挂起态，不消耗任何业务 CPU 算力
+			_, _, errno := unix.Syscall6(
+				unix.SYS_IO_URING_ENTER,
+				uintptr(r.fd),
+				0, // to_submit = 0
+				1, // min_complete = 1
+				IORING_ENTER_GETEVENTS,
+				0, 0,
+			)
+			if errno != 0 && errno != unix.EAGAIN && errno != unix.EINTR {
+				select {
+				case <-r.closeCh:
+					return
+				default:
+					continue
+				}
 			}
-			return 0, 0, errno
+			continue
 		}
 
-		// 被内核唤醒后，重新读取
-		h := atomic.LoadUint32(r.cqHead)
-		t := atomic.LoadUint32(r.cqTail)
-		if h != t {
-			return r.extractCQE(h)
+		// 批处理：疯狂扫光当前 CQ 环里积攒的所有内核已完成事件
+		for head != tail {
+			index := head & *r.cqMask
+			cqe := r.cqes[index]
+
+			// O(1) 终极绝技：把内核吐出来的 64 位 UserData 直接强转回 *IOTask 结构体指针
+			// 彻底干掉全局 Map 查找和对应的读写锁竞争
+			task := (*IOTask)(unsafe.Pointer(uintptr(cqe.UserData)))
+
+			// 提取结果并无缝分发
+			if cqe.Res < 0 {
+				task.Err = unix.Errno(-cqe.Res) // 内核负数代表标准错误码
+				task.ResChan <- 0
+			} else {
+				task.ResChan <- int(cqe.Res) // 塞入成功读取/写入的实际字节数，上游业务协程瞬间苏醒！
+			}
+
+			head++
+			tail = atomic.LoadUint32(r.cqTail)
 		}
+
+		// 统一对内核上报消费进度，腾出 CQ 槽位
+		atomic.StoreUint32(r.cqHead, head)
 	}
 }
 
-// 辅助函数：提取数据并更新 Head
-func (r *Ring) extractCQE(head uint32) (uint64, int32, error) {
-	index := head & *r.cqMask
-	cqe := r.cqes[index]
+// --- 4. 辅助配套工具函数 (正统标准库扩展) ---
 
-	userData := cqe.UserData
-	res := cqe.Res
-
-	// 必须最后更新 head，告知内核该槽位已消费
-	atomic.StoreUint32(r.cqHead, head+1)
-
-	return userData, res, nil
+func (r *Ring) Close() {
+	close(r.closeCh)
+	_ = unix.Munmap(r.sqPtr)
+	if &r.cqPtr[0] != &r.sqPtr[0] {
+		_ = unix.Munmap(r.cqPtr)
+	}
+	_ = unix.Close(r.fd)
 }
 
 func nextPowerOfTwo(n uint32) uint32 {
 	if n <= 1 {
 		return 1
 	}
-	// 如果 n 已经是 2 的幂，直接返回 n
 	if n&(n-1) == 0 {
 		return n
 	}
-	// bits.Len32(n) 返回表示 n 所需的最小位数
-	// 例如 n=5 (101)，Len32 返回 3。1 << 3 = 8
 	return 1 << bits.Len32(n)
+}
+
+func unsafeNewTimer(ns int64) *time.Timer {
+	return time.NewTimer(time.Duration(ns))
+}
+
+func unsafeResetTimer(timer *time.Timer, ns int64) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(time.Duration(ns))
 }
